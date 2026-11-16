@@ -49,6 +49,9 @@ OLLAMA_MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", "deepseek-r1:8b")
 SILICONFLOW_MODEL_NAME = os.getenv("SILICONFLOW_MODEL_NAME", "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
 MAGICK_MODEL_NAME = os.getenv("MAGICK_MODEL_NAME", "gpt-4o-mini")
 RERANK_METHOD = os.getenv("RERANK_METHOD", "cross_encoder")
+# 重排序模型：必须是真正的 cross-encoder（分类头有预训练权重）。
+# 双塔模型（如 distiluse / all-MiniLM）不能用，分类头会被随机初始化，排序结果不可信。
+RERANK_MODEL_NAME = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-base")
 
 MODEL_CHOICES = ["ollama", "siliconflow", "magick"]
 MODEL_DISPLAY_NAMES = {

@@ -12,7 +12,7 @@ import logging
 import re
 import threading
 from functools import lru_cache
-from config import OLLAMA_MODEL_NAME, RERANK_METHOD
+from config import OLLAMA_MODEL_NAME, RERANK_METHOD, RERANK_MODEL_NAME
 
 # 交叉编码器（懒加载 + 线程安全）
 _cross_encoder = None
@@ -27,9 +27,8 @@ def get_cross_encoder():
             if _cross_encoder is None:
                 try:
                     from sentence_transformers import CrossEncoder
-                    _cross_encoder = CrossEncoder(
-                        'sentence-transformers/distiluse-base-multilingual-cased-v2'
-                    )
+                    logging.info(f"加载重排序模型: {RERANK_MODEL_NAME}")
+                    _cross_encoder = CrossEncoder(RERANK_MODEL_NAME)
                     logging.info("交叉编码器加载成功")
                 except Exception as e:
                     logging.error(f"加载交叉编码器失败: {str(e)}")

@@ -24,7 +24,8 @@ from datetime import datetime
 from config import (
     DEFAULT_MODEL_CHOICE, SILICONFLOW_API_KEY, MAGICK_API_KEY,
     OLLAMA_MODEL_NAME, SILICONFLOW_MODEL_NAME, MAGICK_MODEL_NAME,
-    MODEL_CHOICES, MODEL_DISPLAY_NAMES, is_configured_api_key
+    MODEL_CHOICES, MODEL_DISPLAY_NAMES, is_configured_api_key,
+    RERANK_MODEL_NAME,
 )
 
 # 导入核心模块
@@ -167,7 +168,7 @@ def get_system_models_info():
         "嵌入模型": "all-MiniLM-L6-v2",
         "分块方法": "RecursiveCharacterTextSplitter (chunk_size=400, overlap=40)",
         "检索方法": "向量检索 + BM25混合检索 (α=0.7)",
-        "重排序模型": "交叉编码器 (distiluse-base-multilingual-cased-v2)",
+        "重排序模型": f"交叉编码器 ({RERANK_MODEL_NAME})",
         "生成模型(Ollama)": OLLAMA_MODEL_NAME,
         "生成模型(SiliconFlow)": SILICONFLOW_MODEL_NAME,
         "生成模型(Magick API)": MAGICK_MODEL_NAME,
