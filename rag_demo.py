@@ -12,7 +12,7 @@
 """
 
 import os
-import time
+import hashlib
 import logging
 import webbrowser
 import gradio as gr
@@ -35,6 +35,7 @@ from core.embeddings import encode_texts
 from core.vector_store import vector_store
 from core.bm25_index import bm25_manager
 from core.generator import query_answer, call_siliconflow_api, call_magick_api
+from core import store_io
 
 # 导入工具
 from utils.network import is_port_available
@@ -44,17 +45,165 @@ print("Gradio version:", gr.__version__)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 索引持久化
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 只有 Gradio 入口会写盘：api_router 是另一个进程，通过 import 复用本模块的函数，
+# 若两边都写同一份索引文件，后写的会覆盖先写的。
+PERSIST_INDEX = False
+
+
+def enable_persistence():
+    """由 __main__ 调用，开启磁盘持久化"""
+    global PERSIST_INDEX
+    PERSIST_INDEX = True
+
+
+def rebuild_bm25_from_store():
+    """BM25 索引按向量库里的全部内容重建，保证两套索引的语料一致"""
+    if not vector_store.id_order:
+        bm25_manager.clear()
+        return
+    bm25_manager.build_index(
+        [vector_store.contents_map[chunk_id] for chunk_id in vector_store.id_order],
+        list(vector_store.id_order),
+    )
+
+
+def load_persisted_index() -> str:
+    """启动时尝试加载磁盘上的索引，返回一句状态描述"""
+    if not PERSIST_INDEX:
+        return "未启用索引持久化"
+
+    try:
+        state = store_io.load_store()
+    except store_io.StoreIncompatible as exc:
+        logging.warning(f"⚠️ 已有索引与当前配置不兼容，未加载：{exc}")
+        return f"⚠️ 已有索引与当前配置不兼容，未加载（{exc}）"
+    except store_io.StoreError as exc:
+        logging.error(f"⚠️ 索引读取失败，未加载：{exc}")
+        return f"⚠️ 索引读取失败，未加载（{exc}）"
+
+    if not state or not state["id_order"]:
+        return "📂 知识库为空，等待上传文档"
+
+    vector_store.restore(state)
+    rebuild_bm25_from_store()
+    message = (
+        f"📂 已加载知识库：{len(state['documents'])} 个文档，"
+        f"{len(state['id_order'])} 个文本块"
+    )
+    logging.info(message)
+    return message
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 知识库管理（列表 / 删除 / 清空）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def kb_overview_markdown() -> str:
+    """以 Markdown 表格列出已入库文档"""
+    if not PERSIST_INDEX:
+        return "⚠️ 未启用持久化，知识库只存在于内存中，重启即丢失"
+
+    try:
+        state = store_io.load_store()
+    except store_io.StoreError as exc:
+        return f"⚠️ 读取知识库失败：{exc}"
+
+    if not state or not state["id_order"]:
+        return "📂 知识库为空，上传文档后会自动入库"
+
+    lines = [
+        "| 文档 | doc_id | 文本块 | 加入时间 |",
+        "| --- | --- | --- | --- |",
+    ]
+    for doc in state["documents"]:
+        lines.append(
+            f"| {doc['source']} | `{doc['doc_id']}` | {doc['chunks']} | {doc['added_at'] or '-'} |"
+        )
+    lines.append("")
+    lines.append(f"共 **{len(state['documents'])}** 个文档，**{len(state['id_order'])}** 个文本块")
+    return "\n".join(lines)
+
+
+def kb_delete_document(doc_id: str) -> str:
+    """删除单个文档：重建向量索引与 BM25 索引，并同步落盘"""
+    if not PERSIST_INDEX:
+        return "⚠️ 未启用持久化，无法删除"
+
+    doc_id = (doc_id or "").strip().strip("`")
+    if not doc_id:
+        return "请填写要删除的 doc_id（可从上方表格复制）"
+
+    try:
+        state = store_io.load_store()
+    except store_io.StoreError as exc:
+        return f"⚠️ 读取知识库失败：{exc}"
+    if not state:
+        return "📂 知识库为空"
+    if not store_io.document_exists(state, doc_id):
+        return f"❌ 未找到 doc_id 为 {doc_id} 的文档"
+
+    new_state = store_io.delete_document(state, doc_id)
+    try:
+        if new_state["id_order"]:
+            store_io.save_state(new_state)
+            vector_store.restore(new_state)
+        else:
+            # 删空了就把磁盘文件一起清掉，避免留下一个 0 行的索引
+            store_io.clear_store()
+            vector_store.clear()
+        rebuild_bm25_from_store()
+    except store_io.StoreError as exc:
+        return f"⚠️ 删除失败：{exc}"
+
+    return f"🗑️ 已删除 {doc_id}，知识库剩余 {len(vector_store.id_order)} 个文本块"
+
+
+def kb_clear_all() -> str:
+    """清空整个知识库（磁盘 + 内存）"""
+    if not PERSIST_INDEX:
+        return "⚠️ 未启用持久化"
+
+    try:
+        store_io.clear_store()
+    except OSError as exc:
+        return f"⚠️ 清空失败：{exc}"
+
+    vector_store.clear()
+    bm25_manager.clear()
+    return "🗑️ 知识库已清空，请重新上传文档"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 文档处理
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def file_digest(path: str, block_size: int = 1 << 20) -> str:
+    """
+    按文件内容计算 SHA1 摘要
+
+    用内容而不是时间戳做 doc_id 的原因：
+    - 同一份文件重复上传得到同一个 id，可以据此去重
+    - 文件改名不影响 id，不会产生重复数据
+    - 内容变了 id 就变，天然区分不同版本
+    """
+    digest = hashlib.sha1()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(block_size), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def process_multiple_files(files, progress=gr.Progress()):
-    """处理多个文件：提取文本 → 分块 → 向量化 → 构建索引"""
+    """处理多个文件：提取文本 → 分块 → 向量化 → 入库（追加或重建）"""
     if not files:
         return "请选择要上传的文件(支持PDF, Word, Excel, PPT, TXT, Markdown等)", []
 
     try:
-        progress(0.1, desc="清理历史数据...")
-        vector_store.clear()
-        bm25_manager.clear()
+        progress(0.1, desc="准备知识库...")
+        if not PERSIST_INDEX:
+            # 未启用持久化时保持旧行为：每次上传都重建内存索引
+            vector_store.clear()
+            bm25_manager.clear()
 
         total_files = len(files)
         processed_results = []
@@ -65,13 +214,22 @@ def process_multiple_files(files, progress=gr.Progress()):
                 file_name = os.path.basename(file.name)
                 progress((idx - 1) / total_files, desc=f"处理文件 {idx}/{total_files}: {file_name}")
 
+                # doc_id 取自文件内容哈希：同一份文件永远是同一个 id，便于去重与持久化
+                doc_id = file_digest(file.name)[:12]
+                if PERSIST_INDEX and vector_store.has_document(doc_id):
+                    processed_results.append(f"⏭️ {file_name}: 已在知识库中，跳过")
+                    continue
+
                 text = extract_text(file.name)
                 if not text:
                     raise ValueError("文档内容为空或无法提取文本")
 
                 chunks = split_text(text)
-                doc_id = f"doc_{int(time.time())}_{idx}"
-                metadatas = [{"source": file_name, "doc_id": doc_id} for _ in chunks]
+                added_at = datetime.now().isoformat(timespec="seconds")
+                metadatas = [
+                    {"source": file_name, "doc_id": doc_id, "added_at": added_at}
+                    for _ in chunks
+                ]
                 chunk_ids = [f"{doc_id}_chunk_{i}" for i in range(len(chunks))]
 
                 all_chunks.extend(chunks)
@@ -88,10 +246,23 @@ def process_multiple_files(files, progress=gr.Progress()):
             embeddings = encode_texts(all_chunks, show_progress=True)
 
             progress(0.9, desc="构建FAISS索引...")
-            vector_store.build_index(all_chunks, all_ids, all_metadatas, embeddings)
+            if PERSIST_INDEX and vector_store.is_ready:
+                vector_store.append(all_chunks, all_ids, all_metadatas, embeddings)
+            else:
+                vector_store.build_index(all_chunks, all_ids, all_metadatas, embeddings)
 
         progress(0.95, desc="构建BM25检索索引...")
-        bm25_manager.build_index(all_chunks, all_ids)
+        rebuild_bm25_from_store()
+
+        if PERSIST_INDEX and vector_store.has_embeddings:
+            try:
+                store_io.save_store(vector_store)
+                processed_results.append(
+                    f"💾 索引已保存，知识库共 {len(vector_store.id_order)} 个文本块"
+                )
+            except store_io.StoreError as exc:
+                logging.error(f"索引保存失败: {exc}")
+                processed_results.append(f"⚠️ 索引保存失败: {exc}")
 
         summary = f"\n总计处理 {total_files} 个文件，{len(all_chunks)} 个文本块"
         processed_results.append(summary)
@@ -296,6 +467,28 @@ with gr.Blocks(title="本地RAG问答系统") as demo:
                     lines=8, elem_classes="chunk-detail-box"
                 )
 
+        # ━━━ 知识库标签页 ━━━
+        with gr.TabItem("📚 知识库"):
+            with gr.Column():
+                gr.Markdown("## 📚 已入库文档")
+                gr.Markdown(
+                    "索引保存在 `data/index/`，重启后自动加载，不需要重新上传。"
+                    "同一份文件重复上传会被自动跳过。"
+                )
+                with gr.Row():
+                    kb_refresh_btn = gr.Button("🔄 刷新列表", variant="primary")
+                kb_table = gr.Markdown("点击「刷新列表」查看已入库文档")
+                with gr.Row():
+                    kb_doc_id = gr.Textbox(
+                        label="要删除的 doc_id",
+                        placeholder="从上方表格复制 doc_id",
+                        scale=3,
+                    )
+                    kb_delete_btn = gr.Button("🗑️ 删除该文档", variant="secondary", scale=1)
+                kb_message = gr.Textbox(label="操作结果", interactive=False, lines=2)
+                with gr.Row():
+                    kb_clear_btn = gr.Button("⚠️ 清空整个知识库", variant="stop")
+
         # ━━━ 系统监控标签页 ━━━
         with gr.TabItem("📈 系统监控"):
             with gr.Column():
@@ -427,6 +620,17 @@ with gr.Blocks(title="本地RAG问答系统") as demo:
         vector_db_value, vector_db_info, log_display
     ])
     clear_logs_btn.click(fn=lambda: "<div style='color:#4CAF50'>日志已清空</div>", outputs=[log_display])
+    kb_refresh_btn.click(fn=kb_overview_markdown, inputs=[], outputs=[kb_table])
+    kb_delete_btn.click(
+        fn=kb_delete_document,
+        inputs=[kb_doc_id],
+        outputs=[kb_message],
+    ).then(fn=kb_overview_markdown, inputs=[], outputs=[kb_table])
+    kb_clear_btn.click(
+        fn=kb_clear_all,
+        inputs=[],
+        outputs=[kb_message],
+    ).then(fn=kb_overview_markdown, inputs=[], outputs=[kb_table])
     theme_btn.click(fn=toggle_theme, inputs=[], outputs=[], js="""
         () => {
             document.querySelector('body').classList.toggle('dark');
@@ -481,6 +685,10 @@ def check_environment():
 if __name__ == "__main__":
     if not check_environment():
         exit(1)
+
+    # 开启持久化并尝试加载上次的知识库（没有就等用户上传）
+    enable_persistence()
+    print(load_persisted_index())
 
     ports = [17995, 17996, 17997, 17998, 17999]
     selected_port = next((p for p in ports if is_port_available(p)), None)
