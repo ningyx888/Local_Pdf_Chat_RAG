@@ -3,12 +3,17 @@
 
 学习要点：
 - 混合检索（Hybrid Search）结合语义检索和关键词检索的优势
-- alpha 参数控制两者权重（0.7 = 70% 语义 + 30% 关键词）
+- 融合方式两选一（config.FUSION_METHOD）：
+    rrf      —— 倒数排名融合，只看名次，两路对等投票（默认）
+    weighted —— 加权分数求和，alpha 控制两者权重（0.7 = 70% 语义 + 30% 关键词）
 - 递归检索通过多轮迭代，利用 LLM 改写查询获取更全面的信息
 """
 
 import logging
-from config import HYBRID_ALPHA, RETRIEVAL_TOP_K, RERANK_TOP_K, MAX_RETRIEVAL_ITERATIONS
+from config import (
+    HYBRID_ALPHA, RETRIEVAL_TOP_K, RERANK_TOP_K, MAX_RETRIEVAL_ITERATIONS,
+    FUSION_METHOD, RRF_K, RRF_WEIGHT_SEMANTIC, RRF_WEIGHT_BM25,
+)
 from core.vector_store import vector_store
 from core.bm25_index import bm25_manager
 from core.embeddings import encode_query
@@ -76,6 +81,100 @@ def hybrid_merge(semantic_results, bm25_results, alpha=None):
     return sorted(merged_dict.items(), key=lambda x: x[1]['score'], reverse=True)
 
 
+def _semantic_items(semantic_results):
+    """
+    把语义检索结果摊平成 [(doc_id, content, metadata)]，顺序即名次。
+
+    结构异常时返回 []，不抛异常 —— 检索链路宁可少一路，也不要整轮失败。
+    """
+    if not isinstance(semantic_results, dict):
+        return []
+    ids = semantic_results.get('ids')
+    documents = semantic_results.get('documents')
+    metadatas = semantic_results.get('metadatas')
+    for row in (ids, documents, metadatas):
+        if not (isinstance(row, list) and row and isinstance(row[0], list)):
+            return []
+
+    row_ids, row_docs, row_metas = ids[0], documents[0], metadatas[0]
+    if not (len(row_ids) == len(row_docs) == len(row_metas)):
+        return []
+    return [
+        (doc_id, doc, meta)
+        for doc_id, doc, meta in zip(row_ids, row_docs, row_metas)
+        if doc_id
+    ]
+
+
+def _bm25_items(bm25_results):
+    """把 BM25 结果摊平成 [(doc_id, content)]，顺序即名次；缺字段的条目跳过。"""
+    if not isinstance(bm25_results, list):
+        return []
+    items = []
+    for result in bm25_results:
+        if not (isinstance(result, dict) and 'id' in result and 'content' in result):
+            continue
+        items.append((result['id'], result['content']))
+    return items
+
+
+def rrf_merge(semantic_results, bm25_results, k=None, weights=None):
+    """
+    倒数排名融合（Reciprocal Rank Fusion）
+
+        score(d) = Σ w_route / (k + rank_route(d))
+
+    与 hybrid_merge 的关键区别：只用名次，不用分数。因此两路量纲不同
+    （余弦 0-1、BM25 0-20+）不再需要归一化，单个异常高分也压不扁同路其他结果。
+
+    Args:
+        semantic_results: {'ids': [[...]], 'documents': [[...]], 'metadatas': [[...]]}
+        bm25_results: [{'id': ..., 'score': ..., 'content': ...}]
+        k: 平滑常数，默认 config.RRF_K（50）。k 越大越压平头部
+        weights: (语义权重, BM25 权重)，默认读 config，各 1.0 即对等投票
+
+    Returns:
+        按分数降序的 [(doc_id, {'score': ..., 'content': ..., 'metadata': ...})]
+        同分时按 doc_id 升序，保证结果可复现。
+    """
+    if k is None:
+        k = RRF_K
+    if weights is None:
+        weights = (RRF_WEIGHT_SEMANTIC, RRF_WEIGHT_BM25)
+    semantic_weight, bm25_weight = weights
+    k = max(0, int(k))  # 负数会让分母过零甚至为负，直接夹到 0
+
+    merged = {}
+
+    for rank, (doc_id, content, meta) in enumerate(_semantic_items(semantic_results), start=1):
+        entry = merged.get(doc_id)
+        if entry is None:
+            entry = merged[doc_id] = {'score': 0.0, 'content': content, 'metadata': meta}
+        entry['score'] += semantic_weight / (k + rank)
+
+    for rank, (doc_id, content) in enumerate(_bm25_items(bm25_results), start=1):
+        entry = merged.get(doc_id)
+        if entry is None:
+            # 只被 BM25 命中的块：正文来自 BM25，元数据回查向量库的映射表
+            entry = merged[doc_id] = {
+                'score': 0.0,
+                'content': content,
+                'metadata': vector_store.metadatas_map.get(doc_id, {}),
+            }
+        entry['score'] += bm25_weight / (k + rank)
+
+    return sorted(merged.items(), key=lambda item: (-item[1]['score'], item[0]))
+
+
+def fuse_results(semantic_results, bm25_results, method=None):
+    """按 config.FUSION_METHOD 分派融合方式；method 显式传入便于测试与工具复用。"""
+    if method is None:
+        method = FUSION_METHOD
+    if str(method).strip().lower() == "weighted":
+        return hybrid_merge(semantic_results, bm25_results)
+    return rrf_merge(semantic_results, bm25_results)
+
+
 def recursive_retrieval(initial_query, max_iterations=None, enable_web_search=False, model_choice="siliconflow"):
     """
     递归检索与查询优化
@@ -128,7 +227,7 @@ def recursive_retrieval(initial_query, max_iterations=None, enable_web_search=Fa
         bm25_res = bm25_manager.search(query, top_k=RETRIEVAL_TOP_K) if bm25_manager.bm25_index else []
 
         # 混合排序 → 重排序
-        hybrid = hybrid_merge(prepared, bm25_res)
+        hybrid = fuse_results(prepared, bm25_res)
         ids_iter, docs_iter, meta_iter = [], [], []
         for doc_id, data in hybrid[:RETRIEVAL_TOP_K]:
             ids_iter.append(doc_id)

@@ -87,10 +87,18 @@ def choose_default_model(siliconflow_key, magick_key, ollama_available=False):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CHUNK_SIZE = 400          # 文本分块大小（字符数）
 CHUNK_OVERLAP = 40        # 相邻分块的重叠字符数
-HYBRID_ALPHA = 0.7        # 混合检索中语义检索的权重（0-1）
+HYBRID_ALPHA = 0.7        # weighted 融合中语义检索的权重（0-1）
 RETRIEVAL_TOP_K = 10      # 检索返回的候选文档数量
 RERANK_TOP_K = 5          # 重排序后保留的文档数量
 MAX_RETRIEVAL_ITERATIONS = 3  # 递归检索的最大迭代轮数
+
+# 混合检索的融合方式
+#   rrf      —— 倒数排名融合：只看名次，两路对等投票（默认）
+#   weighted —— 旧的加权分数求和：语义名次分 × alpha + BM25 归一化分 × (1-alpha)
+FUSION_METHOD = os.getenv("FUSION_METHOD", "rrf").strip().lower()
+RRF_K = int(os.getenv("RRF_K", "50"))   # 平滑常数，越大越压平头部；0 表示纯 1/rank
+RRF_WEIGHT_SEMANTIC = float(os.getenv("RRF_WEIGHT_SEMANTIC", "1.0"))
+RRF_WEIGHT_BM25 = float(os.getenv("RRF_WEIGHT_BM25", "1.0"))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 第五步：运行时环境配置
