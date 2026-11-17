@@ -10,6 +10,9 @@ __pycache__/
 .cache/
 models/
 
+# 本地索引持久化（向量 + 元数据，由 core/store_io.py 生成）
+data/
+
 # IDE
 .vscode/
 .idea/

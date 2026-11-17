@@ -95,6 +95,9 @@ class VectorStore:
         self.contents_map = {}      # chunk_id -> 文本内容
         self.metadatas_map = {}     # chunk_id -> 元数据
         self.id_order = []          # 按顺序记录的 chunk_id 列表
+        # 向量本身也保留一份：FAISS 把数据拷进自己的 C++ 缓冲区后就不再对外暴露，
+        # 落盘时必须有原始数组可用，否则索引无法持久化。
+        self.embeddings = None      # numpy float32, 形状 (n, dim)，第 i 行对应 id_order[i]
 
     def build_index(self, chunks, chunk_ids, metadatas, embeddings):
         """
@@ -106,20 +109,59 @@ class VectorStore:
             metadatas: 元数据列表
             embeddings: 向量数组 (numpy, float32)
         """
-        dimension = embeddings.shape[1]
-        num_vectors = len(chunks)
+        for chunk_id, chunk, meta in zip(chunk_ids, chunks, metadatas):
+            self.contents_map[chunk_id] = chunk
+            self.metadatas_map[chunk_id] = meta
+            self.id_order.append(chunk_id)
 
-        auto_index = AutoFaissIndex(dimension=dimension)
-        auto_index.select_index_type(num_vectors)
+        self._rebuild(embeddings)
+        logging.info(f"FAISS 索引构建完成，共 {self.index.ntotal} 个文本块，类型: {self.index.index_type}")
+
+    def _rebuild(self, embeddings):
+        """
+        用完整向量矩阵重建 FAISS 索引
+
+        追加、删除、从磁盘恢复都复用这一条路径：
+        FAISS 的行号就是 id_order 的下标，任何行序变化都必须整体重建，
+        否则会出现“搜到的是 A 的向量，取出来却是 B 的文本”。
+        """
+        embeddings = np.ascontiguousarray(embeddings, dtype="float32")
+        auto_index = AutoFaissIndex(dimension=embeddings.shape[1])
+        auto_index.select_index_type(len(embeddings))
+        auto_index.add(embeddings)
+        self.index = auto_index
+        self.embeddings = embeddings
+
+    def append(self, chunks, chunk_ids, metadatas, embeddings):
+        """把新文档的块追加到现有索引（多文档累积，而不是覆盖）"""
+        embeddings = np.ascontiguousarray(embeddings, dtype="float32")
+        if self.has_embeddings and embeddings.shape[1] != self.embeddings.shape[1]:
+            raise ValueError(
+                f"向量维度不一致：已有 {self.embeddings.shape[1]} 维，新数据 {embeddings.shape[1]} 维"
+            )
 
         for chunk_id, chunk, meta in zip(chunk_ids, chunks, metadatas):
             self.contents_map[chunk_id] = chunk
             self.metadatas_map[chunk_id] = meta
             self.id_order.append(chunk_id)
 
-        auto_index.add(embeddings)
-        self.index = auto_index
-        logging.info(f"FAISS 索引构建完成，共 {self.index.ntotal} 个文本块，类型: {auto_index.index_type}")
+        merged = np.vstack([self.embeddings, embeddings]) if self.has_embeddings else embeddings
+        self._rebuild(merged)
+        logging.info(f"索引追加完成，共 {len(self.id_order)} 个文本块")
+        return len(self.id_order)
+
+    def restore(self, state):
+        """从持久化快照恢复，state 来自 core/store_io.load_store()"""
+        self.clear()
+        self.contents_map.update(state["contents_map"])
+        self.metadatas_map.update(state["metadatas_map"])
+        self.id_order.extend(state["id_order"])
+        self._rebuild(state["embeddings"])
+        logging.info(f"索引已从磁盘恢复，共 {len(self.id_order)} 个文本块")
+
+    def has_document(self, doc_id):
+        """该文档是否已在索引中（上传时用于去重）"""
+        return any(meta.get("doc_id") == doc_id for meta in self.metadatas_map.values())
 
     def search(self, query_embedding, k=10):
         """
@@ -150,6 +192,11 @@ class VectorStore:
         return self.index is not None and self.index.ntotal > 0
 
     @property
+    def has_embeddings(self):
+        """是否保留了可落盘的原始向量"""
+        return self.embeddings is not None and len(self.embeddings) > 0
+
+    @property
     def total_chunks(self):
         return self.index.ntotal if self.index is not None else 0
 
@@ -158,6 +205,7 @@ class VectorStore:
         self.contents_map.clear()
         self.metadatas_map.clear()
         self.id_order.clear()
+        self.embeddings = None
         logging.info("向量存储已清空")
 
 
