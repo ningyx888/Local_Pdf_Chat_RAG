@@ -13,7 +13,8 @@ import requests
 from config import (
     SILICONFLOW_API_KEY, SILICONFLOW_API_URL,
     SILICONFLOW_MODEL_NAME, OLLAMA_MODEL_NAME,
-    MAGICK_API_KEY, MAGICK_API_URL, MAGICK_MODEL_NAME
+    MAGICK_API_KEY, MAGICK_API_URL, MAGICK_MODEL_NAME,
+    MAX_HISTORY_TURNS, CONVERSATION_CONDENSE
 )
 from utils.network import get_session
 from core.retriever import recursive_retrieval
@@ -140,10 +141,10 @@ def call_cloud_api(prompt, model_choice="siliconflow", temperature=0.7, max_toke
     raise ValueError(f"未知云端模型服务: {model_choice}")
 
 
-def call_llm_simple(prompt, model_choice="siliconflow"):
+def call_llm_simple(prompt, model_choice="siliconflow", temperature=0.7):
     """简单的 LLM 调用（用于递归检索中的查询改写判断）"""
     if model_choice in ("siliconflow", "magick"):
-        result = call_cloud_api(prompt, model_choice)
+        result = call_cloud_api(prompt, model_choice, temperature=temperature)
         result = result.strip() if isinstance(result, str) else result[0].strip()
         if "<think>" in result:
             result = result.split("<think>")[0].strip()
@@ -151,18 +152,122 @@ def call_llm_simple(prompt, model_choice="siliconflow"):
     elif model_choice == "ollama":
         response = get_session().post(
             "http://localhost:11434/api/generate",
-            json={"model": OLLAMA_MODEL_NAME, "prompt": prompt, "stream": False},
+            json={"model": OLLAMA_MODEL_NAME, "prompt": prompt, "stream": False,
+                  "options": {"temperature": temperature}},
             timeout=180
         )
         return response.json().get("response", "").strip()
     raise ValueError(f"未知模型选择: {model_choice}")
 
 
+# ━━━ 对话记忆 ━━━
+
+def _normalize_history(history, max_turns=MAX_HISTORY_TURNS, max_chars=2000):
+    """
+    把 UI 传来的历史对话整理成最近 N 轮的 messages 列表。
+
+    支持两种格式：
+    - messages 格式：[{"role": "user", "content": "..."}, ...]（Gradio 6 默认）
+    - 旧式二元组：[("问题", "回答"), ...]
+
+    超过 max_turns 的更早对话直接丢弃：既省 token，也避免旧话题干扰检索。
+    """
+    if not history:
+        return []
+
+    turns = []
+    for item in history:
+        if isinstance(item, dict):
+            role = item.get("role")
+            content = item.get("content")
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            turns.append({"role": "user", "content": str(item[0])})
+            if item[1]:
+                turns.append({"role": "assistant", "content": str(item[1])})
+            continue
+        else:
+            continue
+        if role in ("user", "assistant") and content:
+            turns.append({"role": role, "content": str(content)})
+
+    if max_turns and max_turns > 0:
+        turns = turns[-max_turns * 2:]
+
+    # 超长回答会撑爆 prompt，从最旧的一轮开始丢
+    while len(turns) > 2 and sum(len(t["content"]) for t in turns) > max_chars:
+        turns = turns[2:]
+
+    return turns
+
+
+def _format_chat_history(history, max_turns=MAX_HISTORY_TURNS):
+    """把历史对话拼成提示词片段；没有历史时返回空串。"""
+    turns = _normalize_history(history, max_turns=max_turns)
+    if not turns:
+        return ""
+
+    lines = []
+    for turn in turns:
+        speaker = "用户" if turn["role"] == "user" else "助手"
+        lines.append(f"{speaker}：{turn['content']}")
+    return "\n".join(lines)
+
+
+def condense_question(question, history, model_choice="siliconflow"):
+    """
+    把依赖上文的问题改写成可独立检索的问题。
+
+    例：上文在聊“三项指标”，用户追问“第二个展开说说”
+        → 改写为“第二项指标的具体内容和含义”
+
+    检索是用问题原文做 BM25/向量匹配的，“第二个”这种词匹配不到任何内容，
+    所以必须在检索之前完成指代消解。失败时原样返回，不影响主流程。
+    """
+    history_text = _format_chat_history(history)
+    if not history_text:
+        return question
+
+    prompt = f"""你是一个查询改写助手。根据以下对话历史，把用户最后一个问题改写成不依赖上下文、可以独立理解的一句话。
+
+对话历史：
+{history_text}
+
+用户最后一个问题：{question}
+
+要求：
+1. 补全问题中省略的主语、指代对象和上文提到的名词，例如“它”“第二个”“再短一点”
+2. 只输出改写后的问题本身，不要解释、不要加引号、不要换行
+3. 如果原问题本身已经完整，直接原样输出
+4. 保持原问题的语言"""
+
+    try:
+        rewritten = call_llm_simple(prompt, model_choice, temperature=0.0)
+    except Exception as e:
+        logging.error(f"问题改写失败，使用原问题检索: {str(e)}")
+        return question
+
+    if not isinstance(rewritten, str):
+        return question
+    rewritten = rewritten.strip().strip('"“”\'`').strip()
+
+    # 模型可能返回错误文本或长篇大论，这两种都不是有效查询
+    if not rewritten or len(rewritten) > 200:
+        logging.warning("问题改写结果不可用，使用原问题检索")
+        return question
+    if rewritten.startswith(("错误", "调用", "发生未知错误", "API返回")):
+        logging.warning("问题改写返回错误信息，使用原问题检索")
+        return question
+
+    if rewritten != question:
+        logging.info(f"问题改写: {question} -> {rewritten}")
+    return rewritten
+
+
 def _build_prompt(question, context, enable_web_search, knowledge_base_exists,
-                  time_sensitive, conflict_detected):
+                  time_sensitive, conflict_detected, chat_history=None):
     """构建提示词"""
     prompt_template = """作为一个专业的问答助手，你需要基于以下{context_type}回答用户问题。
-
+{history_section}
 提供的参考内容：
 {context}
 
@@ -178,9 +283,16 @@ def _build_prompt(question, context, enable_web_search, knowledge_base_exists,
 
 请现在开始回答："""
 
+    history_text = _format_chat_history(chat_history)
+    history_section = (
+        "\n最近对话（仅用于理解当前问题的指代和承接关系，事实仍以参考内容为准）：\n"
+        f"{history_text}\n"
+    ) if history_text else ""
+
     return prompt_template.format(
         context_type="本地文档和网络搜索结果" if enable_web_search and knowledge_base_exists else (
             "网络搜索结果" if enable_web_search else "本地文档"),
+        history_section=history_section,
         context=context if context else (
             "网络搜索结果将用于回答。" if enable_web_search and not knowledge_base_exists else "知识库为空或未找到相关内容。"),
         question=question,
@@ -218,22 +330,32 @@ def _build_context(all_contexts, all_doc_ids, all_metadata, enable_web_search):
     return "\n\n".join(context_parts), sources_for_conflict
 
 
-def query_answer(question, enable_web_search=False, model_choice="siliconflow", progress=None):
+def query_answer(question, enable_web_search=False, model_choice="siliconflow", progress=None,
+                 history=None):
     """
     问答处理主流程（非流式）
 
-    完整流程：递归检索 → 构建上下文 → 矛盾检测 → 构建Prompt → LLM生成
+    完整流程：指代消解 → 递归检索 → 构建上下文 → 矛盾检测 → 构建Prompt → LLM生成
+
+    history: 之前的对话（messages 格式），用于理解追问。为空时行为与单轮问答完全一致。
     """
     try:
         knowledge_base_exists = vector_store.is_ready
         if not knowledge_base_exists and not enable_web_search:
             return "⚠️ 知识库为空，请先上传文档。"
 
+        history = _normalize_history(history)
+        search_query = question
+        if history and CONVERSATION_CONDENSE:
+            if progress:
+                progress(0.15, desc="理解上下文...")
+            search_query = condense_question(question, history, model_choice)
+
         if progress:
             progress(0.3, desc="执行递归检索...")
 
         all_contexts, all_doc_ids, all_metadata = recursive_retrieval(
-            initial_query=question, enable_web_search=enable_web_search, model_choice=model_choice
+            initial_query=search_query, enable_web_search=enable_web_search, model_choice=model_choice
         )
 
         context, sources = _build_context(all_contexts, all_doc_ids, all_metadata, enable_web_search)
@@ -241,7 +363,8 @@ def query_answer(question, enable_web_search=False, model_choice="siliconflow", 
         time_sensitive = any(w in question for w in ["最新", "今年", "当前", "最近", "刚刚"])
 
         prompt = _build_prompt(question, context, enable_web_search,
-                               knowledge_base_exists, time_sensitive, conflict_detected)
+                               knowledge_base_exists, time_sensitive, conflict_detected,
+                               chat_history=history)
 
         if progress:
             progress(0.8, desc="生成回答...")
@@ -267,7 +390,8 @@ def query_answer(question, enable_web_search=False, model_choice="siliconflow", 
         return f"系统错误: {str(e)}"
 
 
-def stream_answer(question, enable_web_search=False, model_choice="siliconflow", progress=None):
+def stream_answer(question, enable_web_search=False, model_choice="siliconflow", progress=None,
+                  history=None):
     """问答处理主流程（流式，用于 Gradio generator 模式）"""
     try:
         knowledge_base_exists = vector_store.is_ready
@@ -275,11 +399,18 @@ def stream_answer(question, enable_web_search=False, model_choice="siliconflow",
             yield "⚠️ 知识库为空，请先上传文档。", "遇到错误"
             return
 
+        history = _normalize_history(history)
+        search_query = question
+        if history and CONVERSATION_CONDENSE:
+            if progress:
+                progress(0.15, desc="理解上下文...")
+            search_query = condense_question(question, history, model_choice)
+
         if progress:
             progress(0.3, desc="执行递归检索...")
 
         all_contexts, all_doc_ids, all_metadata = recursive_retrieval(
-            initial_query=question, enable_web_search=enable_web_search, model_choice=model_choice
+            initial_query=search_query, enable_web_search=enable_web_search, model_choice=model_choice
         )
 
         context, sources = _build_context(all_contexts, all_doc_ids, all_metadata, enable_web_search)
@@ -287,7 +418,8 @@ def stream_answer(question, enable_web_search=False, model_choice="siliconflow",
         time_sensitive = any(w in question for w in ["最新", "今年", "当前", "最近", "刚刚"])
 
         prompt = _build_prompt(question, context, enable_web_search,
-                               knowledge_base_exists, time_sensitive, conflict_detected)
+                               knowledge_base_exists, time_sensitive, conflict_detected,
+                               chat_history=history)
 
         if model_choice in ("siliconflow", "magick"):
             full_answer = call_cloud_api(prompt, model_choice, temperature=0.7, max_tokens=1536)

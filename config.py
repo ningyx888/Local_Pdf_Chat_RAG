@@ -53,6 +53,11 @@ RERANK_METHOD = os.getenv("RERANK_METHOD", "cross_encoder")
 # 双塔模型（如 distiluse / all-MiniLM）不能用，分类头会被随机初始化，排序结果不可信。
 RERANK_MODEL_NAME = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-base")
 
+# 对话记忆：送入提示词的最大历史轮数（1 轮 = 1 问 + 1 答）
+MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "4"))
+# 是否在检索前把追问改写成独立问题（多一次 LLM 调用，但能让“第二个”这类追问检索到东西）
+CONVERSATION_CONDENSE = os.getenv("CONVERSATION_CONDENSE", "1").strip().lower() not in ("0", "false", "no")
+
 MODEL_CHOICES = ["ollama", "siliconflow", "magick"]
 MODEL_DISPLAY_NAMES = {
     "ollama": "本地 Ollama 模型",
