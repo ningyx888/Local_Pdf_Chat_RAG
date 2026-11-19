@@ -53,6 +53,14 @@ RERANK_METHOD = os.getenv("RERANK_METHOD", "cross_encoder")
 # 双塔模型（如 distiluse / all-MiniLM）不能用，分类头会被随机初始化，排序结果不可信。
 RERANK_MODEL_NAME = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-base")
 
+# LLM 重排参数（仅 RERANK_METHOD=llm 时生效）
+# 只把前 N 条候选交给 LLM 排序：listwise 提示词随候选数线性变长，太多会超上下文也拖慢延迟
+LLM_RERANK_MAX_CANDIDATES = int(os.getenv("LLM_RERANK_MAX_CANDIDATES", "10"))
+# 每条候选截断到多少字符：判断相关性不需要看完整段落，但截断会损失细节
+LLM_RERANK_DOC_CHARS = int(os.getenv("LLM_RERANK_DOC_CHARS", "200"))
+# 排序是确定性任务，默认不要发散
+LLM_RERANK_TEMPERATURE = float(os.getenv("LLM_RERANK_TEMPERATURE", "0.0"))
+
 # 对话记忆：送入提示词的最大历史轮数（1 轮 = 1 问 + 1 答）
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "4"))
 # 是否在检索前把追问改写成独立问题（多一次 LLM 调用，但能让“第二个”这类追问检索到东西）

@@ -236,7 +236,8 @@ def recursive_retrieval(initial_query, max_iterations=None, enable_web_search=Fa
 
         if docs_iter:
             try:
-                reranked = rerank_results(query, docs_iter, ids_iter, meta_iter, top_k=RERANK_TOP_K)
+                reranked = rerank_results(query, docs_iter, ids_iter, meta_iter,
+                                          top_k=RERANK_TOP_K, model_choice=model_choice)
             except Exception as e:
                 logging.error(f"重排序失败: {str(e)}")
                 reranked = [(did, {'content': d, 'metadata': m, 'score': 1.0})
